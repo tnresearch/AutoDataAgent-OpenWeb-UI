@@ -28,6 +28,8 @@
 	import EyeSlash from '$lib/components/icons/EyeSlash.svelte';
 	import MessageInput from './MessageInput.svelte';
 	import FolderPlaceholder from './Placeholder/FolderPlaceholder.svelte';
+	import DataSourcePicker from './Messages/AutoDataAgent/DataSourcePicker.svelte';
+	import SuggestedQuestions from './Messages/AutoDataAgent/SuggestedQuestions.svelte';
 	import FolderTitle from './Placeholder/FolderTitle.svelte';
 
 	const i18n = getContext('i18n');
@@ -203,6 +205,13 @@
 									{/if}
 								</div>
 							{/if}
+						{/if}
+
+						<!-- AutoDataAgent: source picker for the virtual model OR
+						     any custom model with the auto-data-agent tool attached -->
+						{#if models[selectedModelIdx]?.id === 'auto-data-analyst' || models[selectedModelIdx]?.info?.meta?.toolIds?.includes('server:auto-data-agent')}
+							<DataSourcePicker />
+							<SuggestedQuestions />
 						{/if}
 					</div>
 				</div>

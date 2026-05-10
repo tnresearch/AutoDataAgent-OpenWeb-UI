@@ -82,6 +82,12 @@
 	import { processWeb, processWebSearch, processYoutubeVideo } from '$lib/apis/retrieval';
 	import { getAndUpdateUserLocation, getUserSettings } from '$lib/apis/users';
 	import {
+		selectedSourceIds as autoDataAgentSourceIds,
+		sourceLabels as autoDataAgentSourceLabels
+	} from '$lib/stores/auto-data-agent';
+	import { get as getStore } from 'svelte/store';
+	import DataSourcePicker from '$lib/components/chat/Messages/AutoDataAgent/DataSourcePicker.svelte';
+	import {
 		generateQueries,
 		chatAction,
 		generateMoACompletion,
@@ -2304,17 +2310,49 @@
 		// Only send terminal_id if the model has terminal capability enabled
 		const terminalEnabled = model.info?.meta?.capabilities?.terminal ?? true;
 
+		// AutoDataAgent integration: ship selected database source IDs alongside
+		// the chat request when the virtual model is in use.
+		const adaSourceIds =
+			model.id === 'auto-data-analyst' ? getStore(autoDataAgentSourceIds) : [];
+
+		// AutoDataAgent (tool path): when a custom model has the
+		// run_autodataagent_analysis tool attached, the LLM cannot guess the
+		// user's selected source UUIDs — inject them into a synthetic system
+		// message so the LLM passes them to the tool's source_ids parameter.
+		const hasAdaTool = model.info?.meta?.toolIds?.includes('server:auto-data-agent') ?? false;
+		const adaToolSourceIds = hasAdaTool ? getStore(autoDataAgentSourceIds) : [];
+		let messagesForRequest = messages;
+		if (hasAdaTool && adaToolSourceIds.length > 0) {
+			const labels = getStore(autoDataAgentSourceLabels) || {};
+			const sourceLines = adaToolSourceIds
+				.map((id) => `  - ${id}: ${labels[id] || '(name unknown)'}`)
+				.join('\n');
+			const adaSystemMessage = {
+				role: 'system',
+				content:
+					`The user has selected the following data source UUIDs for analysis:\n` +
+					`${sourceLines}\n\n` +
+					`When you call the run_autodataagent_analysis tool, you MUST pass these ` +
+					`exact UUIDs in the source_ids parameter. Do not invent UUIDs or omit them. ` +
+					`If the user asks an analytical question and the tool needs source_ids, ` +
+					`use the list above.`
+			};
+			messagesForRequest = [adaSystemMessage, ...messages];
+		}
+
 		const res = await generateOpenAIChatCompletion(
 			localStorage.token,
 			{
 				stream: stream,
 				model: model.id,
-				...(messages.length > 0 ? { messages } : {}),
+				...(messagesForRequest.length > 0 ? { messages: messagesForRequest } : {}),
 				params: {
 					...$settings?.params,
 					...params,
 					stop: getStopTokens()
 				},
+
+				...(adaSourceIds.length > 0 ? { data_source_ids: adaSourceIds } : {}),
 
 				files: (files?.length ?? 0) > 0 ? files : undefined,
 
@@ -2937,6 +2975,19 @@
 									/>
 								</div>
 							</div>
+
+							<!-- AutoDataAgent: compact source picker re-entry while chatting.
+							     Show for the virtual model OR any custom model with the
+							     auto-data-agent tool attached. -->
+							{#if selectedModels.some((mid) => {
+								if (mid === 'auto-data-analyst') return true;
+								const m = $models?.find?.((x) => x.id === mid);
+								return m?.info?.meta?.toolIds?.includes('server:auto-data-agent');
+							})}
+								<div class="flex justify-center pb-1 -mt-1">
+									<DataSourcePicker compact={true} />
+								</div>
+							{/if}
 
 							<div class=" pb-2 {dragged ? 'z-0' : 'z-10'}">
 								<MessageInput

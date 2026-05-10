@@ -18,6 +18,12 @@
 	import AlertRenderer, { alertComponent } from './AlertRenderer.svelte';
 	import Collapsible from '$lib/components/common/Collapsible.svelte';
 	import ToolCallDisplay from '$lib/components/common/ToolCallDisplay.svelte';
+
+	// AutoDataAgent tool result divert: when the LLM calls our tool, the
+	// generic ToolCallDisplay JSON view is unhelpful; render the rich
+	// charts + insights panel inline instead.
+	import AnalysisResult from '$lib/components/chat/Messages/AutoDataAgent/AnalysisResult.svelte';
+	import { extractAdaTaskIdFromToolResult } from '$lib/apis/auto-data-agent';
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
 	import Download from '$lib/components/icons/Download.svelte';
 	import ConsecutiveDetailsGroup from './ConsecutiveDetailsGroup.svelte';
@@ -376,7 +382,25 @@
 				{#each token.items as detailToken, detailIdx}
 					{@const textContent = getDetailTextContent(detailToken)}
 
-					{#if detailToken?.attributes?.type === 'tool_calls'}
+					{#if detailToken?.attributes?.type === 'tool_calls' && detailToken?.attributes?.name === 'run_autodataagent_analysis'}
+						<!-- AutoDataAgent: divert to rich AnalysisResult panel.
+						     The tool returns a task_id even on soft timeouts, so
+						     adaTaskId is present in practice; the ToolCallDisplay
+						     fallback is for malformed-result edge cases. -->
+						{@const adaTaskId = extractAdaTaskIdFromToolResult(getDetailTextContent(detailToken))}
+						{#if adaTaskId}
+							<AnalysisResult taskId={adaTaskId} token={localStorage.token} />
+						{:else}
+							<ToolCallDisplay
+								id={`${id}-${tokenIdx}-${detailIdx}-tc`}
+								attributes={detailToken.attributes}
+								resultContent={getDetailTextContent(detailToken)}
+								grouped={true}
+								open={$settings?.expandDetails ?? false}
+								className="w-full space-y-1"
+							/>
+						{/if}
+					{:else if detailToken?.attributes?.type === 'tool_calls'}
 						<ToolCallDisplay
 							id={`${id}-${tokenIdx}-${detailIdx}-tc`}
 							attributes={detailToken.attributes}
@@ -424,7 +448,21 @@
 	{:else if token.type === 'details'}
 		{@const textContent = getDetailTextContent(token)}
 
-		{#if token?.attributes?.type === 'tool_calls'}
+		{#if token?.attributes?.type === 'tool_calls' && token?.attributes?.name === 'run_autodataagent_analysis'}
+			<!-- AutoDataAgent: divert to rich AnalysisResult panel -->
+			{@const adaTaskId = extractAdaTaskIdFromToolResult(getDetailTextContent(token))}
+			{#if adaTaskId}
+				<AnalysisResult taskId={adaTaskId} token={localStorage.token} />
+			{:else}
+				<ToolCallDisplay
+					id={`${id}-${tokenIdx}-tc`}
+					attributes={token.attributes}
+					resultContent={getDetailTextContent(token)}
+					open={$settings?.expandDetails ?? false}
+					className="w-full space-y-1"
+				/>
+			{/if}
+		{:else if token?.attributes?.type === 'tool_calls'}
 			<!-- Tool calls have dedicated handling with ToolCallDisplay component -->
 			<ToolCallDisplay
 				id={`${id}-${tokenIdx}-tc`}
