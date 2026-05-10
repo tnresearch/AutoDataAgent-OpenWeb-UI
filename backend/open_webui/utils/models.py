@@ -92,8 +92,11 @@ async def get_all_models(request, refresh: bool = False, user: UserModel = None)
     # deep copy the base models to avoid modifying the original list
     models = [model.copy() for model in base_models]
 
-    # If there are no models, return an empty list
-    if len(models) == 0:
+    # If there are no models, return an empty list — UNLESS the AutoDataAgent
+    # virtual model is enabled, since that model has no upstream LLM dependency
+    # and should remain selectable even when external providers are unreachable.
+    import os as _os
+    if len(models) == 0 and not _os.environ.get('AUTO_DATA_AGENT_API_KEY') and not _os.environ.get('AUTO_DATA_AGENT_USERNAME'):
         return []
 
     # Add arena models
@@ -372,6 +375,38 @@ async def get_all_models(request, refresh: bool = False, user: UserModel = None)
                 continue
             if getattr(function_module, 'toggle', None):
                 model['filters'].extend(get_filter_items_from_module(filter_function, function_module))
+
+    # AutoDataAgent integration — inject the virtual model when the integration
+    # is configured. The chat completion handler intercepts requests with this
+    # model_id and forwards them to the AutoDataAgent_Backend service.
+    import os as _os
+    if _os.environ.get('AUTO_DATA_AGENT_API_KEY') or _os.environ.get('AUTO_DATA_AGENT_USERNAME'):
+        models.append({
+            'id': 'auto-data-analyst',
+            'name': 'Auto Data Analyst',
+            'object': 'model',
+            'created': int(time.time()),
+            'owned_by': 'auto-data-agent',
+            'info': {
+                'meta': {
+                    'description': 'AI-powered CSV / database analysis. Upload CSV files and ask analytical questions to get charts, insights, and summaries.',
+                    'profile_image_url': '/static/favicon.png',
+                    'capabilities': {
+                        'vision': False,
+                        'usage': False,
+                        'citations': False,
+                        # AutoDataAgent does its own data ingestion + RAG. Disable
+                        # Open WebUI's file-context middleware so it doesn't
+                        # rewrite the user message with a `### Task: … <context>…`
+                        # template (which both pollutes the chat history and
+                        # confuses the analysis backend).
+                        'file_context': False,
+                    },
+                    'tags': [{'name': 'data-analysis'}, {'name': 'auto-data-agent'}],
+                },
+            },
+            'auto_data_agent': True,
+        })
 
     log.debug(f'get_all_models() returned {len(models)} models')
 

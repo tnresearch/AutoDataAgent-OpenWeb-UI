@@ -106,6 +106,7 @@ from open_webui.routers import (
     terminals,
     automations,
     calendar,
+    auto_data_agent,
 )
 
 from open_webui.routers.retrieval import (
@@ -1455,6 +1456,9 @@ app.include_router(utils.router, prefix='/api/v1/utils', tags=['utils'])
 app.include_router(terminals.router, prefix='/api/v1/terminals', tags=['terminals'])
 app.include_router(automations.router, prefix='/api/v1/automations', tags=['automations'])
 app.include_router(calendar.router, prefix='/api/v1/calendars', tags=['calendars'])
+
+# AutoDataAgent integration — proxies analysis requests to the AutoDataAgent_Backend service
+app.include_router(auto_data_agent.router, prefix='/api/v1/auto-data-agent', tags=['auto-data-agent'])
 
 # SCIM 2.0 API for identity management
 if ENABLE_SCIM:

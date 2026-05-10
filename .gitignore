@@ -310,3 +310,9 @@ dist
 cypress/videos
 cypress/screenshots
 .vscode/settings.json
+.gstack/
+
+# Local dev convenience scripts — contain personal API keys / passwords
+# (Telenor JWT, AutoDataAgent API key, etc.) and are reconstructible per-dev.
+dev-backend.sh
+dev-frontend.sh

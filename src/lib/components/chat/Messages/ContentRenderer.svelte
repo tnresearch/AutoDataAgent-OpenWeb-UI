@@ -15,8 +15,21 @@
 	import FloatingButtons from '../ContentRenderer/FloatingButtons.svelte';
 	import { createMessagesList } from '$lib/utils';
 
+	// AutoDataAgent integration — detect embedded marker emitted by the
+	// virtual auto-data-analyst model and render the rich result UI.
+	import AnalysisResult from './AutoDataAgent/AnalysisResult.svelte';
+	import { extractTaskMarker, stripTaskMarker } from '$lib/apis/auto-data-agent';
+
 	export let id;
 	export let content;
+
+	// Reactive derivations — keep regex work outside the template
+	$: adaTaskId = extractTaskMarker(content);
+	$: strippedContent = stripTaskMarker(content ?? '');
+	$: renderedContent =
+		model?.info?.meta?.capabilities?.citations == false
+			? strippedContent.replace(/\s*(\[(?:\d+(?:#[^,\]\s]+)?(?:,\s*\d+(?:#[^,\]\s]+)?)*)\])+/g, '')
+			: strippedContent;
 
 	export let history;
 	export let messageId;
@@ -174,11 +187,19 @@
 </script>
 
 <div bind:this={contentContainerElement}>
+	{#if extractTaskMarker(content)}
+		{@const _adaTaskId = extractTaskMarker(content)}
+		<AnalysisResult taskId={_adaTaskId} token={localStorage.token} />
+	{/if}
+
 	<Markdown
 		{id}
-		content={model?.info?.meta?.capabilities?.citations == false
-			? content.replace(/\s*(\[(?:\d+(?:#[^,\]\s]+)?(?:,\s*\d+(?:#[^,\]\s]+)?)*)\])+/g, '')
-			: content}
+		content={(() => {
+			let _c = model?.info?.meta?.capabilities?.citations == false
+				? content.replace(/\s*(\[(?:\d+(?:#[^,\]\s]+)?(?:,\s*\d+(?:#[^,\]\s]+)?)*)\])+/g, '')
+				: content;
+			return stripTaskMarker(_c);
+		})()}
 		{model}
 		{save}
 		{preview}
