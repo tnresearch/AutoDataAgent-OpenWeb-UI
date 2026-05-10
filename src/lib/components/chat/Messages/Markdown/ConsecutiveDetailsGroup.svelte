@@ -32,7 +32,15 @@
 	export let messageDone = true;
 	export let allowEmbeds = true;
 
+	// AutoDataAgent: when this group contains a run_autodataagent_analysis
+	// tool call, default-expand so the user immediately sees the rich
+	// AnalysisResult panel (charts/insights/progress) without having to
+	// hunt for the chevron. Other tools keep the user-configured default.
+	$: hasAdaTool = tokens.some(
+		(t) => t?.attributes?.type === 'tool_calls' && t?.attributes?.name === 'run_autodataagent_analysis'
+	);
 	let open = $settings?.expandDetails ?? false;
+	$: if (hasAdaTool) open = true;
 
 	function parseJSONString(str: string) {
 		try {
