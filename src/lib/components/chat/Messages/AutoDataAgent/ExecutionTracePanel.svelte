@@ -132,6 +132,39 @@
 		return `${m}m ${s}s`;
 	}
 
+	function fmtJson(v: unknown): string {
+		if (v == null) return '';
+		if (typeof v === 'string') return v;
+		try {
+			return JSON.stringify(v, null, 2);
+		} catch {
+			return String(v);
+		}
+	}
+
+	function hasArgs(v: unknown): boolean {
+		if (v == null) return false;
+		if (typeof v === 'string') return v.length > 0;
+		if (typeof v === 'object') return Object.keys(v as Record<string, unknown>).length > 0;
+		return true;
+	}
+
+	/** Pull rich fields out of debug_info, falling back to legacy top-level fields. */
+	function stepDetail(step: StepTrace): {
+		thoughts: string;
+		tools: string[];
+		toolArgs: unknown;
+		result: string;
+	} {
+		const dbg = (step.debug_info ?? {}) as Record<string, any>;
+		return {
+			thoughts: (dbg.thoughts as string) || step.description || '',
+			tools: Array.isArray(dbg.tools) ? (dbg.tools as string[]) : [],
+			toolArgs: dbg.tool_args ?? null,
+			result: (dbg.last_tool_result as string) || ''
+		};
+	}
+
 	function toggleDebug(stepId: string) {
 		const next = new Set(debugOpenIds);
 		if (next.has(stepId)) next.delete(stepId);
@@ -240,13 +273,14 @@
 				{#if trace?.steps?.length}
 					<ol class="relative space-y-2">
 						{#each trace.steps as step, i (step.step_id || i)}
+							{@const detail = stepDetail(step)}
 							<li class="flex gap-3">
 								<!-- Status circle + connector -->
 								<div class="flex flex-col items-center flex-shrink-0">
 									<div
 										class={`w-6 h-6 rounded-full flex items-center justify-center text-[10px] font-semibold text-white ${statusColor(step.status)}`}
 									>
-										{step.step_index + 1}
+										{step.step_index}
 									</div>
 									{#if i < trace.steps.length - 1}
 										<div class="flex-1 w-px bg-gray-200 dark:bg-gray-700 mt-0.5"></div>
@@ -268,13 +302,37 @@
 											{/if}
 										</div>
 									</div>
-									{#if step.description}
-										<p class="text-xs text-gray-500 dark:text-gray-400 mt-0.5">{step.description}</p>
+									{#if detail.thoughts}
+										<details class="mt-1.5 group" open>
+											<summary class="cursor-pointer text-[10px] font-semibold uppercase tracking-wide text-gray-400 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-300 select-none">
+												Thoughts
+											</summary>
+											<p class="mt-1 ml-0.5 text-xs text-gray-600 dark:text-gray-300 whitespace-pre-wrap break-words leading-relaxed">{detail.thoughts}</p>
+										</details>
 									{/if}
-									{#if step.output_summary}
-										<p class="text-xs text-gray-600 dark:text-gray-300 mt-1 italic">
-											→ {step.output_summary}
-										</p>
+									{#if detail.tools.length}
+										<div class="mt-1.5 flex items-center gap-1.5 flex-wrap">
+											<span class="text-[10px] font-semibold uppercase tracking-wide text-gray-400 dark:text-gray-500">Tool</span>
+											{#each detail.tools as t}
+												<code class="text-[11px] px-1.5 py-0.5 rounded bg-violet-50 dark:bg-violet-900/30 text-violet-700 dark:text-violet-300 font-mono">{t}</code>
+											{/each}
+										</div>
+									{/if}
+									{#if hasArgs(detail.toolArgs)}
+										<details class="mt-1.5">
+											<summary class="cursor-pointer text-[10px] font-semibold uppercase tracking-wide text-gray-400 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-300 select-none">
+												Arguments
+											</summary>
+											<pre class="mt-1 text-[11px] p-2 rounded bg-gray-50 dark:bg-gray-800/60 text-gray-700 dark:text-gray-200 font-mono overflow-auto max-h-48 whitespace-pre-wrap break-words">{fmtJson(detail.toolArgs)}</pre>
+										</details>
+									{/if}
+									{#if detail.result}
+										<details class="mt-1.5">
+											<summary class="cursor-pointer text-[10px] font-semibold uppercase tracking-wide text-gray-400 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-300 select-none">
+												Result
+											</summary>
+											<pre class="mt-1 text-[11px] p-2 rounded bg-gray-50 dark:bg-gray-800/60 text-gray-700 dark:text-gray-200 font-mono overflow-auto max-h-64 whitespace-pre-wrap break-words">{detail.result}</pre>
+										</details>
 									{/if}
 									{#if step.deviation_reason}
 										<p class="text-xs text-amber-600 dark:text-amber-400 mt-1">
@@ -283,7 +341,7 @@
 									{/if}
 									{#if step.replanned && (step.corrective_steps_added?.length ?? 0) > 0}
 										<p class="text-[11px] text-amber-500 dark:text-amber-400 mt-0.5">
-											+{step.corrective_steps_added.length} corrective step(s) added
+											+{step.corrective_steps_added?.length ?? 0} corrective step(s) added
 										</p>
 									{/if}
 									{#if step.observation && (step.observation.what_we_expected || step.observation.what_we_got || step.observation.gap)}
@@ -312,20 +370,6 @@
 												{/if}
 											</div>
 										</details>
-									{/if}
-									{#if step.debug_info}
-										<button
-											type="button"
-											class="mt-1 text-[11px] text-gray-400 dark:text-gray-500 hover:text-violet-500 dark:hover:text-violet-400"
-											on:click={() => toggleDebug(step.step_id || String(i))}
-										>
-											{debugOpenIds.has(step.step_id || String(i)) ? 'Hide' : 'Show'} debug
-										</button>
-										{#if debugOpenIds.has(step.step_id || String(i))}
-											<pre
-												class="text-[10px] mt-1 p-2 rounded bg-gray-50 dark:bg-gray-850 text-gray-600 dark:text-gray-300 overflow-auto max-h-48"
-												>{JSON.stringify(step.debug_info, null, 2)}</pre>
-										{/if}
 									{/if}
 								</div>
 							</li>

@@ -1976,7 +1976,17 @@ async def chat_completion(
         try:
             form_data, metadata, events = await process_chat_payload(request, form_data, user, metadata, model)
 
-            response = await chat_completion_handler(request, form_data, user)
+            # Route AutoDataAgent virtual model to its dedicated handler instead
+            # of forwarding to the upstream LLM API.
+            _current_model_id = form_data.get('model', '')
+            _current_model_entry = request.app.state.MODELS.get(_current_model_id, {})
+            if _current_model_entry.get('auto_data_agent'):
+                from open_webui.utils.auto_data_agent_chat import (
+                    handle_chat_completion as _ada_handle,
+                )
+                response = await _ada_handle(request, form_data, user)
+            else:
+                response = await chat_completion_handler(request, form_data, user)
 
             # When the upstream provider returns an error (e.g. HTTP 400
             # content-filter, quota exceeded), generate_chat_completion

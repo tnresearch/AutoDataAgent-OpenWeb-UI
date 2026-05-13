@@ -205,6 +205,12 @@ async def get_all_models(request, refresh: bool = False, user: UserModel = None)
                 **({'pipe': pipe} if pipe is not None else {}),
                 **({'provider': base_model.get('provider')} if base_model and base_model.get('provider') else {}),
                 **({'loaded': base_model.get('loaded')} if base_model and base_model.get('loaded') is not None else {}),
+                # Propagate auto_data_agent flag so process_chat can intercept correctly.
+                **(
+                    {'auto_data_agent': True}
+                    if custom_model.base_model_id == 'auto-data-analyst'
+                    else {}
+                ),
             }
 
             info = custom_model.model_dump()
