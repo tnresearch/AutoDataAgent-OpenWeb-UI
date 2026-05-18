@@ -557,6 +557,9 @@ from open_webui.utils.middleware import (
     process_chat_payload,
     process_chat_response,
 )
+from open_webui.utils.auto_data_agent_chat import (
+    handle_chat_completion as _ada_handle,
+)
 from open_webui.utils.tools import set_tool_servers, set_terminal_servers
 
 from open_webui.utils.auth import (
@@ -1981,9 +1984,6 @@ async def chat_completion(
             _current_model_id = form_data.get('model', '')
             _current_model_entry = request.app.state.MODELS.get(_current_model_id, {})
             if _current_model_entry.get('auto_data_agent'):
-                from open_webui.utils.auto_data_agent_chat import (
-                    handle_chat_completion as _ada_handle,
-                )
                 response = await _ada_handle(request, form_data, user)
             else:
                 response = await chat_completion_handler(request, form_data, user)

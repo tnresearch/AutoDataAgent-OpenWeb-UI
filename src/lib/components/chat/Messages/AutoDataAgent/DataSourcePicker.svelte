@@ -117,16 +117,32 @@
 		selected = next;
 	}
 
-	async function toggleAllInConnection(conn: DataConnection) {
-		const sources = await ensureSourcesLoaded(conn.connection_id);
+	// Synchronous: sources are always pre-loaded by openModal before the user
+	// can interact. Keeping this synchronous avoids Svelte re-rendering during
+	// an await and transiently resetting the checkbox to its pre-click state.
+	function toggleAllInConnection(conn: DataConnection) {
+		const sources = sourcesByConnection[conn.connection_id] ?? [];
 		const next = new Set(selected);
-		const allSelected = sources.every((s) => next.has(s.source_id));
+		const allSelected = sources.length > 0 && sources.every((s) => next.has(s.source_id));
 		if (allSelected) {
 			for (const s of sources) next.delete(s.source_id);
 		} else {
 			for (const s of sources) next.add(s.source_id);
 		}
 		selected = next;
+	}
+
+	// Svelte action that sets both .checked and .indeterminate as DOM properties.
+	// Neither can be reliably controlled via HTML attributes:
+	//  - setAttribute('checked', …) only affects the default state, not current state
+	//  - 'indeterminate' has no HTML attribute counterpart at all
+	function triCheckbox(node: HTMLInputElement, state: 'none' | 'partial' | 'all') {
+		function apply(s: 'none' | 'partial' | 'all') {
+			node.checked = s === 'all';
+			node.indeterminate = s === 'partial';
+		}
+		apply(state);
+		return { update: apply };
 	}
 
 	function connectionSelectionState(conn: DataConnection): 'none' | 'partial' | 'all' {
@@ -160,16 +176,13 @@
 	async function openModal() {
 		modalOpen = true;
 		if (connections.length === 0) await loadConnections();
-		// If we have selected ids, eagerly load their connections so labels are available.
-		const stillUnknown = $selectedSourceIds.filter((id) => !$sourceLabels[id]);
-		if (stillUnknown.length > 0) {
-			// Load every connection's sources — we don't know which connection owns which id.
-			for (const conn of connections) {
-				if (!sourcesByConnection[conn.connection_id]) {
-					await ensureSourcesLoaded(conn.connection_id);
-				}
-			}
-		}
+		// Always pre-load sources for every connection so parent checkboxes reflect
+		// accurate tri-state. Without this, connectionSelectionState() returns 'none'
+		// for connections whose sources haven't been fetched yet, causing the parent
+		// checkbox to appear unchecked even when all children are selected — and a
+		// subsequent click then deselects everything instead of confirming the selection.
+		// ensureSourcesLoaded is idempotent: already-loaded connections return immediately.
+		await Promise.all(connections.map((c) => ensureSourcesLoaded(c.connection_id)));
 		await tick();
 	}
 
@@ -280,12 +293,13 @@
 							<div
 								class="flex items-center gap-2 px-3 py-2 hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors"
 							>
-								<!-- Tri-state checkbox for connection-wide select -->
+								<!-- Tri-state checkbox for connection-wide select.
+								     use:triCheckbox sets .checked and .indeterminate as DOM
+								     properties on every update — the only correct way in Svelte. -->
 								<input
 									type="checkbox"
 									class="accent-violet-600"
-									checked={state === 'all'}
-									indeterminate={state === 'partial'}
+									use:triCheckbox={state}
 									on:change={() => toggleAllInConnection(conn)}
 									on:click|stopPropagation
 									aria-label={`Select all sources in ${conn.name}`}

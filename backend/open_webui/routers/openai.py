@@ -1237,15 +1237,35 @@ async def generate_chat_completion(
     try:
         session = await get_session()
 
-        r = await session.request(
-            method='POST',
-            url=request_url,
-            data=payload,
-            headers=headers,
-            cookies=cookies,
-            ssl=AIOHTTP_CLIENT_SESSION_SSL,
-            timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT),
-        )
+        # Retry once on stale keep-alive connection reset.
+        # Long upstream processing (e.g. RAG retrieval) can leave an idle
+        # pooled TCP connection that the remote server has already closed.
+        # aiohttp doesn't detect this until the first write fails with
+        # ECONNRESET (errno 54) or ServerDisconnectedError.  One retry on a
+        # fresh connection is sufficient to handle this race condition.
+        _last_conn_err = None
+        for _retry in range(4):
+            try:
+                r = await session.request(
+                    method='POST',
+                    url=request_url,
+                    data=payload,
+                    headers=headers,
+                    cookies=cookies,
+                    ssl=AIOHTTP_CLIENT_SESSION_SSL,
+                    timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT),
+                )
+                _last_conn_err = None
+                break
+            except (aiohttp.ClientOSError, aiohttp.ServerDisconnectedError) as _conn_err:
+                _last_conn_err = _conn_err
+                log.warning(
+                    'generate_chat_completion: connection reset (attempt %d/4), retrying: %s',
+                    _retry + 1,
+                    _conn_err,
+                )
+        if _last_conn_err is not None:
+            raise _last_conn_err
 
         # Check if response is SSE
         if 'text/event-stream' in r.headers.get('Content-Type', ''):

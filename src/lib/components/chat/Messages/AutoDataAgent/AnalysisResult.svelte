@@ -19,6 +19,45 @@
 	export let taskId: string;
 	export let token: string;
 
+	// Original task_id passed in from the chat content. Read-only — we
+	// never write back to the export. When the user clicks Retry, the
+	// new task_id is tracked in `currentTaskId` and remembered in
+	// localStorage so a page reload / component re-mount continues
+	// tracking the latest rerun instead of reverting to the original
+	// failed task (which would silently undo the retry).
+	const _originalTaskId = taskId;
+	const _RERUN_STORAGE_KEY = 'ada:rerun-redirects';
+
+	function _loadRerunRedirect(orig: string): string {
+		try {
+			const map = JSON.parse(localStorage.getItem(_RERUN_STORAGE_KEY) || '{}');
+			// Follow chain in case user reran multiple times.
+			let cur = orig;
+			const seen = new Set<string>([cur]);
+			while (map[cur] && !seen.has(map[cur])) {
+				cur = map[cur];
+				seen.add(cur);
+			}
+			return cur;
+		} catch {
+			return orig;
+		}
+	}
+	function _saveRerunRedirect(from: string, to: string) {
+		try {
+			const map = JSON.parse(localStorage.getItem(_RERUN_STORAGE_KEY) || '{}');
+			map[from] = to;
+			localStorage.setItem(_RERUN_STORAGE_KEY, JSON.stringify(map));
+		} catch {}
+	}
+
+	// `currentTaskId` is the *effective* task being polled. Initialised
+	// to the latest rerun in storage (if any) so a reload picks up where
+	// the user left off. We deliberately read from `currentTaskId`
+	// (not the export `taskId`) everywhere inside this component so
+	// parent re-renders don't snap us back to the original failed task.
+	let currentTaskId: string = _loadRerunRedirect(_originalTaskId);
+
 	let task: AnalysisTask | null = null;
 	let result: AnalysisResultData | null = null;
 	let loading = true;
@@ -77,7 +116,7 @@
 			const verb = next === 'completed' ? 'finished' : 'failed';
 			new Notification(`Analysis ${verb}`, {
 				body: task?.question ? `“${task.question.slice(0, 80)}”` : 'Open the chat to view results.',
-				tag: `ada-${taskId}`
+				tag: `ada-${currentTaskId}`
 			});
 		} catch {
 			/* swallow — non-critical */
@@ -88,14 +127,14 @@
 		if (aborted) return;
 		pollCount += 1;
 		try {
-			task = await getTask(token, taskId);
+			task = await getTask(token, currentTaskId);
 			error = null;
 			consecutiveErrors = 0;
 			notifyOnCompletion(priorStatus, task.status);
 			priorStatus = task.status;
 			if (task.status === 'completed' || task.status === 'failed') {
 				try {
-					result = await getTaskResults(token, taskId);
+					result = await getTaskResults(token, currentTaskId);
 				} catch (e) {
 					console.warn('Auto Data Analyst — result fetch failed:', e);
 				}
@@ -137,7 +176,7 @@
 		if (!task || actionPending) return;
 		actionPending = 'stop';
 		try {
-			await stopTask(token, taskId);
+			await stopTask(token, currentTaskId);
 			// Force-refresh to pick up the new (failed/cancelled) state
 			refresh();
 		} catch (e: any) {
@@ -151,10 +190,17 @@
 		if (!task || actionPending) return;
 		actionPending = 'rerun';
 		try {
-			const newTask = await rerunTask(token, taskId);
-			// Hand off to the new task: reset state and start polling it
+			// Always rerun the CURRENT task in the chain (could be the original
+			// or a previously rerun task). Pre-fix this used `taskId` which is
+			// a re-bindable export — when the parent component re-rendered the
+			// Markdown tool block (e.g. user navigates away and back), the
+			// export would snap back to _originalTaskId, so every retry click
+			// would rerun the FIRST failure forever, never the latest attempt.
+			const newTask = await rerunTask(token, currentTaskId);
 			if (newTask?.task_id) {
-				taskId = newTask.task_id;
+				// Update local tracking AND persist so reload keeps the chain.
+				currentTaskId = newTask.task_id;
+				_saveRerunRedirect(_originalTaskId, newTask.task_id);
 				task = null;
 				result = null;
 				loading = true;
@@ -209,7 +255,7 @@
 		actionPending = 'export';
 		exportError = null;
 		try {
-			await downloadReport(token, taskId, format);
+			await downloadReport(token, currentTaskId, format);
 		} catch (e: any) {
 			exportError = e?.message ?? String(e);
 		} finally {
@@ -218,7 +264,7 @@
 	}
 
 	onMount(() => {
-		if (taskId) refresh();
+		if (currentTaskId) refresh();
 		// Request notification permission lazily; users only see this prompt
 		// once per origin and only the first time they open an analysis.
 		if (
@@ -394,6 +440,53 @@
 	{/if}
 
 	<div class="p-5 space-y-5">
+		<!-- Failure banner (top of body for visibility).
+		     Previously the failed-task error message lived at the bottom,
+		     below empty chart/insight sections, so users browsing a failed
+		     run saw only the panel header + empty space and assumed it was
+		     still "loading". Surface failures prominently up front. -->
+		{#if task?.status === 'failed'}
+			<div
+				class="border-2 border-red-300 dark:border-red-800 rounded-lg bg-red-50 dark:bg-red-900/30 px-4 py-3 flex items-start gap-3"
+			>
+				<svg
+					class="w-5 h-5 flex-shrink-0 mt-0.5 text-red-500 dark:text-red-400"
+					fill="none" viewBox="0 0 24 24" stroke="currentColor"
+				>
+					<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+						d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+				</svg>
+				<div class="min-w-0 flex-1">
+					<p class="text-sm font-semibold text-red-800 dark:text-red-200">
+						{#if task.error_message?.startsWith('Telenor AI Factory edge proxy')}
+							LLM upstream unavailable
+						{:else if task.error_message?.startsWith('Historical failure')}
+							Old failure (pre-fix)
+						{:else if task.error_message?.startsWith('Historical OOM')}
+							Old failure (OOM)
+						{:else}
+							Analysis failed
+						{/if}
+					</p>
+					{#if task.error_message}
+						<p class="mt-1 text-sm text-red-700 dark:text-red-300 whitespace-pre-wrap leading-snug">
+							{task.error_message}
+						</p>
+					{/if}
+					{#if task.error_message?.startsWith('Telenor AI Factory edge proxy')}
+						<button
+							class="mt-2 inline-flex items-center gap-1 text-xs border border-red-300 dark:border-red-700 rounded px-2.5 py-1 text-red-700 dark:text-red-200 hover:bg-red-100 dark:hover:bg-red-900/50 transition-colors disabled:opacity-50"
+							on:click={onRerun}
+							disabled={actionPending !== null}
+							title="Re-run with same inputs"
+						>
+							{actionPending === 'rerun' ? 'Submitting…' : '↻ Retry analysis'}
+						</button>
+					{/if}
+				</div>
+			</div>
+		{/if}
+
 		<!-- Loading / progress -->
 		{#if isInitialLoad || isRunning}
 			<div class="border border-blue-200 dark:border-blue-800 rounded-lg bg-blue-50 dark:bg-blue-900/20 px-4 py-3">
@@ -436,12 +529,8 @@
 			</div>
 		{/if}
 
-		{#if task?.status === 'failed' && task.error_message}
-			<div class="border border-red-200 dark:border-red-800 rounded-lg bg-red-50 dark:bg-red-900/20 px-4 py-3 text-sm text-red-700 dark:text-red-300">
-				<strong>Analysis failed:</strong>
-				<p class="mt-1 whitespace-pre-wrap">{task.error_message}</p>
-			</div>
-		{/if}
+		<!-- Old bottom-of-panel failure block intentionally removed —
+		     superseded by the prominent banner at top of body. -->
 
 		{#if exportError}
 			<div class="border border-red-200 dark:border-red-800 rounded-lg bg-red-50 dark:bg-red-900/20 px-4 py-2 text-xs text-red-700 dark:text-red-300">
@@ -451,7 +540,7 @@
 
 		<!-- Execution trace (collapsed by default; expands on click) -->
 		{#if task && (isRunning || charts.length > 0 || insights.length > 0)}
-			<ExecutionTracePanel {taskId} {token} live={isRunning} />
+			<ExecutionTracePanel taskId={currentTaskId} {token} live={isRunning} />
 		{/if}
 
 		<!-- Insights — primary section. Each insight opens a side drawer

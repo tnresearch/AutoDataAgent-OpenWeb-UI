@@ -47,6 +47,13 @@ async def get_session() -> aiohttp.ClientSession:
         connector_kwargs = {
             'ttl_dns_cache': AIOHTTP_POOL_DNS_TTL,
             'enable_cleanup_closed': True,
+            # Close idle connections after 5 s so they are not reused after
+            # the remote server's keep-alive timeout (Telenor AI Factory /
+            # MiniMax drops idle connections in ~10 s).  Without this, the
+            # pool accumulates stale connections that all fail with ECONNRESET
+            # when a request is eventually made on them (e.g. after RAG
+            # retrieval delays), causing "Server Connection Error" to the user.
+            'keepalive_timeout': 5.0,
         }
         if AIOHTTP_POOL_CONNECTIONS is not None:
             connector_kwargs['limit'] = AIOHTTP_POOL_CONNECTIONS

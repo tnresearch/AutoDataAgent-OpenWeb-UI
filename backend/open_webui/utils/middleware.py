@@ -4413,6 +4413,127 @@ async def streaming_chat_response_handler(response, ctx):
                                 )
                                 reasoning_item['status'] = 'completed'
 
+                    # ── MiniMax native XML tool-call detection ─────────────────────
+                    # When tools are not provided via the OpenAI API (e.g. the user
+                    # disabled the tool toggle), MiniMax M-series models fall back
+                    # from OpenAI-style tool_calls to their own XML format:
+                    #   minimax:tool_call
+                    #   <invoke name="fn_name">
+                    #     <parameter name="arg">value</parameter>
+                    #   </invoke>
+                    # OpenWebUI treats this as plain text and streams it verbatim —
+                    # which is meaningless to users. Intercept it:
+                    #   • Tools ARE available in metadata → parse XML, synthesise
+                    #     OpenAI-format tool_calls, let the normal loop execute them.
+                    #   • Tools NOT available → replace with a clear "enable tools" msg.
+                    if not response_tool_calls and content.lstrip().startswith('minimax:tool_call'):
+                        log.info('stream_body_handler: detected MiniMax native XML tool-call format')
+                        available_tools = metadata.get('tools', {})
+                        if available_tools:
+                            import xml.etree.ElementTree as _ET
+                            _xml_text = content.lstrip()[len('minimax:tool_call'):].strip()
+                            try:
+                                _root_el = _ET.fromstring(f'<root>{_xml_text}</root>')
+                                for _invoke_el in _root_el.findall('invoke'):
+                                    _tool_name = _invoke_el.get('name', '')
+                                    if not _tool_name:
+                                        continue
+                                    _params = {}
+                                    for _param_el in _invoke_el.findall('parameter'):
+                                        _p_name = _param_el.get('name', '')
+                                        _p_text = (_param_el.text or '').strip()
+                                        if _p_name:
+                                            try:
+                                                _params[_p_name] = json.loads(_p_text)
+                                            except (json.JSONDecodeError, ValueError):
+                                                _params[_p_name] = _p_text
+                                    if _tool_name:
+                                        response_tool_calls.append({
+                                            'id': f'tc_mm_{uuid4().hex[:12]}',
+                                            'index': len(response_tool_calls),
+                                            'function': {
+                                                'name': _tool_name,
+                                                'arguments': json.dumps(_params),
+                                            },
+                                        })
+                                if response_tool_calls:
+                                    content = ''
+                                    output.clear()
+                                    output.append({
+                                        'type': 'message',
+                                        'id': output_id('msg'),
+                                        'status': 'in_progress',
+                                        'role': 'assistant',
+                                        'content': [{'type': 'output_text', 'text': ''}],
+                                    })
+                                    log.info(
+                                        'stream_body_handler: converted %d MiniMax XML call(s) to synthetic function_calls',
+                                        len(response_tool_calls),
+                                    )
+                            except Exception as _xml_err:
+                                log.debug('stream_body_handler: MiniMax XML parse error: %s', _xml_err)
+                        else:
+                            # Tools unavailable — re-call the LLM without tool
+                            # instructions so it answers directly in natural language.
+                            # Guard against infinite recursion: if this re-call already
+                            # happened once (flagged in metadata), give up gracefully.
+                            if metadata.get('_minimax_xml_retried'):
+                                log.warning(
+                                    'stream_body_handler: MiniMax XML still present after retry; giving up'
+                                )
+                            else:
+                                log.info(
+                                    'stream_body_handler: tools unavailable — re-calling LLM for direct answer'
+                                )
+                                content = ''
+                                output.clear()
+                                _direct_metadata = {**metadata, '_minimax_xml_retried': True}
+                                _direct_messages = add_or_update_system_message(
+                                    (
+                                        'The data-analysis tool is currently disabled in this conversation. '
+                                        'Answer the user\'s question directly as a senior data analyst '
+                                        'using your own knowledge and reasoning. '
+                                        'Do NOT output XML, tool-call tags, or any structured function-call syntax.'
+                                    ),
+                                    list(form_data.get('messages', [])),
+                                    append=True,
+                                )
+                                _direct_form_data = {
+                                    **form_data,
+                                    'stream': True,
+                                    'metadata': _direct_metadata,
+                                    'messages': _direct_messages,
+                                }
+                                _direct_form_data.pop('tools', None)
+                                try:
+                                    _direct_res = await generate_chat_completion(
+                                        request, _direct_form_data, user, bypass_system_prompt=True
+                                    )
+                                    if isinstance(_direct_res, StreamingResponse):
+                                        await stream_body_handler(_direct_res, _direct_form_data)
+                                except Exception as _direct_err:
+                                    log.warning(
+                                        'stream_body_handler: direct re-call failed: %s', _direct_err
+                                    )
+                                    _err_msg = (
+                                        'I encountered an error while processing your request. '
+                                        'Please try again.'
+                                    )
+                                    content = _err_msg
+                                    output.clear()
+                                    output.append({
+                                        'type': 'message',
+                                        'id': output_id('msg'),
+                                        'status': 'completed',
+                                        'role': 'assistant',
+                                        'content': [{'type': 'output_text', 'text': _err_msg}],
+                                    })
+                                    await event_emitter({
+                                        'type': 'chat:completion',
+                                        'data': {'content': serialize_output(output)},
+                                    })
+                                return
+
                     if response_tool_calls:
                         tool_calls.append(_split_tool_calls(response_tool_calls))
 
@@ -4524,14 +4645,47 @@ async def streaming_chat_response_handler(response, ctx):
                                 try:
                                     tool_function_params = json.loads(tool_args)
                                 except Exception as e:
-                                    log.error(f'Error parsing tool call arguments: {tool_args}')
-                                    results.append(
-                                        {
-                                            'tool_call_id': tool_call_id,
-                                            'content': f'Error: Tool call arguments could not be parsed. The model generated malformed or incomplete JSON for `{tool_function_name}`. Please try again.',
-                                        }
-                                    )
-                                    continue
+                                    # Third fallback: MiniMax XML argument format.
+                                    # Some MiniMax M-series versions encode tool
+                                    # arguments as <invoke>/<parameter> XML even
+                                    # when called via the OpenAI-compatible API.
+                                    _xml_parsed = False
+                                    try:
+                                        import xml.etree.ElementTree as _ET3
+                                        _xmlp: dict = {}
+                                        for _p3 in _ET3.fromstring(
+                                            f'<root>{tool_args.strip()}</root>'
+                                        ).iter('parameter'):
+                                            _k3 = _p3.get('name', '')
+                                            _v3 = (_p3.text or '').strip()
+                                            if _k3:
+                                                try:
+                                                    _xmlp[_k3] = json.loads(_v3)
+                                                except (json.JSONDecodeError, ValueError):
+                                                    _xmlp[_k3] = _v3
+                                        if _xmlp:
+                                            tool_function_params = _xmlp
+                                            _xml_parsed = True
+                                            log.info(
+                                                'Parsed MiniMax XML arguments for %s: %s',
+                                                tool_function_name,
+                                                list(_xmlp.keys()),
+                                            )
+                                    except Exception:
+                                        pass
+                                    if not _xml_parsed:
+                                        log.error(
+                                            'Error parsing tool call arguments for %s: %r',
+                                            tool_function_name,
+                                            tool_args[:400],
+                                        )
+                                        results.append(
+                                            {
+                                                'tool_call_id': tool_call_id,
+                                                'content': f'Error: Tool call arguments could not be parsed. The model generated malformed or incomplete JSON for `{tool_function_name}`. Please try again.',
+                                            }
+                                        )
+                                        continue
 
                         # Ensure arguments are valid JSON for downstream LLM integrations
                         log.debug(f'Parsed args from {tool_args} to {tool_function_params}')

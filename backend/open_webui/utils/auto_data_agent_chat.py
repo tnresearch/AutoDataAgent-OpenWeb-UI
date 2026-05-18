@@ -18,7 +18,9 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
+import uuid
 from typing import Any, List, Optional
 
 import httpx
@@ -39,15 +41,41 @@ ANALYZABLE_EXT = {".csv", ".xlsx", ".xls", ".json", ".txt", ".pdf"}
 
 TERMINAL_STATUSES = {"completed", "failed"}
 
+# Upload guardrails — mirror those in routers/auto_data_agent.py so an
+# `auto-data-analyst` model invocation can't accidentally bypass the
+# Path-C limits by going through the chat-completions middleware.
+_MAX_FILES_PER_UPLOAD = int(os.environ.get("AUTO_DATA_AGENT_MAX_FILES", "20"))
+_MAX_FILE_SIZE_BYTES = int(os.environ.get("AUTO_DATA_AGENT_MAX_FILE_SIZE_MB", "100")) * 1024 * 1024
+_MAX_TOTAL_UPLOAD_BYTES = int(os.environ.get("AUTO_DATA_AGENT_MAX_TOTAL_UPLOAD_MB", "300")) * 1024 * 1024
+
+# MIME type guess by extension. The AutoDataAgent backend looks at the
+# extension anyway, but a sensible Content-Type avoids surprises in any
+# middleware that sniffs the multipart parts.
+_EXT_MIME = {
+    ".csv": "text/csv",
+    ".json": "application/json",
+    ".txt": "text/plain",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".xls": "application/vnd.ms-excel",
+    ".pdf": "application/pdf",
+}
+
 # Regex used to detect a marker emitted by a prior turn.
 # UUID is 8-4-4-4-12 hex; a loose [0-9a-f-]+ would greedily eat the closing
 # "--" of the HTML comment and yield an invalid task_id.
-import re as _re
-_TASK_MARKER_RE = _re.compile(
+_TASK_MARKER_RE = re.compile(
     r"<!--auto-data-analyst:task_id="
     r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
     r"-->",
-    _re.I,
+    re.I,
+)
+
+# Lenient UUID matcher — used to drop garbage source_ids before they
+# hit the AutoDataAgent backend, matching the cleaning the backend does
+# itself in agent_tools.analyze._clean_source_ids.
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
 )
 
 
@@ -117,22 +145,29 @@ def _extract_question(form_data: dict) -> str:
 
 
 _RAG_TASK_HEADER = "### Task:"
+_RAG_CONTEXT_OPEN = "<context>"
+_RAG_CONTEXT_CLOSE = "</context>"
 
 
 def _strip_rag_envelope(text: str) -> str:
     """
     OWUI prepends ``### Task: …  <context>…</context>`` and appends the user's
     original question after the closing tag. Recover the tail; if the pattern
-    isn't present, return the original text unchanged.
+    isn't fully present, return the original text unchanged.
+
+    The previous fallback (take the last non-empty line when ``</context>``
+    is missing) lost legitimate user text whose question happened to mention
+    ``### Task:`` — e.g. a multi-line spec ending with the user's actual ask.
     """
     if _RAG_TASK_HEADER not in text:
         return text
-    end = text.rfind("</context>")
-    if end == -1:
-        # No context block — best effort: return the last non-empty line.
-        tail = [ln.strip() for ln in text.splitlines() if ln.strip()]
-        return tail[-1] if tail else text
-    return text[end + len("</context>"):].strip() or text
+    if _RAG_CONTEXT_OPEN not in text or _RAG_CONTEXT_CLOSE not in text:
+        # Looks like the user just *mentioned* "### Task:" rather than the
+        # OWUI middleware injecting a full envelope. Leave the text alone.
+        return text
+    end = text.rfind(_RAG_CONTEXT_CLOSE)
+    tail = text[end + len(_RAG_CONTEXT_CLOSE):].strip()
+    return tail or text
 
 
 async def _extract_csv_files(form_data: dict) -> List[dict]:
@@ -188,10 +223,16 @@ async def _extract_csv_files(form_data: dict) -> List[dict]:
     return resolved
 
 
+def _new_completion_id() -> str:
+    """Build a unique completion ID. UUID4 avoids the collision risk of
+    `int(time.time()*1000)` when multiple chunks emit in the same ms."""
+    return f"chatcmpl-ada-{uuid.uuid4().hex[:24]}"
+
+
 def _openai_chunk(model: str, content: str = "", finish_reason: Optional[str] = None) -> str:
     """Format an OpenAI-compatible streaming SSE chunk."""
     chunk = {
-        "id": f"chatcmpl-ada-{int(time.time() * 1000)}",
+        "id": _new_completion_id(),
         "object": "chat.completion.chunk",
         "created": int(time.time()),
         "model": model,
@@ -209,7 +250,7 @@ def _openai_chunk(model: str, content: str = "", finish_reason: Optional[str] = 
 def _openai_full_response(model: str, content: str) -> dict:
     """Build a non-streamed OpenAI-compatible completion."""
     return {
-        "id": f"chatcmpl-ada-{int(time.time() * 1000)}",
+        "id": _new_completion_id(),
         "object": "chat.completion",
         "created": int(time.time()),
         "model": model,
@@ -230,7 +271,14 @@ def _extract_source_ids(form_data: dict) -> List[str]:
     """
     Pull data source IDs from form_data. The frontend ships them via
     form_data['metadata']['data_source_ids'] (preferred) or top-level
-    form_data['data_source_ids']. Returns a deduplicated list.
+    form_data['data_source_ids'].
+
+    Returns a deduplicated list of lowercased, whitespace-stripped UUIDs.
+    Mirrors the cleaning done by the AutoDataAgent backend
+    (agent_tools.analyze._clean_source_ids) so the values we forward
+    match what the backend's validator accepts. Anything that doesn't
+    look like a UUID is silently dropped — this is best-effort frontend
+    cleanup, the backend will still report invalid IDs explicitly.
     """
     metadata = form_data.get("metadata") or {}
     candidates = (
@@ -240,28 +288,55 @@ def _extract_source_ids(form_data: dict) -> List[str]:
     )
     if isinstance(candidates, str):
         # Tolerate "id1,id2" shape
-        candidates = [s.strip() for s in candidates.split(",") if s.strip()]
-    seen, result = set(), []
+        candidates = [s for s in candidates.split(",")]
+    seen: set = set()
+    result: List[str] = []
     for s in candidates:
-        if isinstance(s, str) and s and s not in seen:
-            seen.add(s)
-            result.append(s)
+        if not isinstance(s, str):
+            continue
+        t = s.strip().lower()
+        if not t or not _UUID_RE.match(t) or t in seen:
+            continue
+        seen.add(t)
+        result.append(t)
     return result
+
+
+async def _list_org_sources() -> List[dict]:
+    """Return all data sources available in the org from the AutoDataAgent backend."""
+    # Reuse the proxy router's shared client so we benefit from connection
+    # pooling and the keepalive_expiry tuning instead of opening a fresh
+    # TCP connection per call.
+    from open_webui.routers.auto_data_agent import _get_client
+    try:
+        client = await _get_client()
+        r = await client.get(
+            f"{_backend_url()}/api/v1/agent-tools/sources",
+            headers=await _auth_headers(),
+            timeout=httpx.Timeout(connect=5.0, read=15.0, write=5.0, pool=5.0),
+        )
+        if r.status_code == 200:
+            return r.json().get("sources") or []
+    except Exception as e:
+        log.warning(f"AutoDataAgent — could not list org sources: {e}")
+    return []
 
 
 async def _submit_from_sources(question: str, source_ids: List[str]) -> dict:
     """POST to AutoDataAgent /api/v1/analysis/upload-from-sources for DB-source analysis."""
+    from open_webui.routers.auto_data_agent import _get_client
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            r = await client.post(
-                f"{_backend_url()}/api/v1/analysis/upload-from-sources",
-                headers=await _auth_headers(),
-                data={
-                    "question": question,
-                    "source_ids": json.dumps(source_ids),
-                    "agent_engine": "openmanus",
-                },
-            )
+        client = await _get_client()
+        r = await client.post(
+            f"{_backend_url()}/api/v1/analysis/upload-from-sources",
+            headers=await _auth_headers(),
+            data={
+                "question": question,
+                "source_ids": json.dumps(source_ids),
+                "agent_engine": "openmanus",
+            },
+            timeout=httpx.Timeout(connect=10.0, read=60.0, write=30.0, pool=5.0),
+        )
     except httpx.RequestError as e:
         raise HTTPException(status_code=502, detail=f"AutoDataAgent backend unreachable: {e}") from e
 
@@ -272,9 +347,23 @@ async def _submit_from_sources(question: str, source_ids: List[str]) -> dict:
 
 
 async def _submit_to_backend(question: str, files: List[dict]) -> dict:
-    """POST the question + CSV bytes to AutoDataAgent /api/v1/analysis/upload."""
+    """POST the question + CSV bytes to AutoDataAgent /api/v1/analysis/upload.
+
+    Enforces upload guardrails (count / per-file / total size) before
+    buffering bytes so a malformed `auto-data-analyst` invocation can't
+    accidentally exhaust memory.
+    """
+    from open_webui.routers.auto_data_agent import _get_client
+
+    if len(files) > _MAX_FILES_PER_UPLOAD:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Too many files (max {_MAX_FILES_PER_UPLOAD}).",
+        )
+
     multipart_files = []
     skipped: List[str] = []
+    total_bytes = 0
     for f in files:
         if not f.get("path"):
             skipped.append(f.get("filename") or f.get("id") or "?")
@@ -287,6 +376,31 @@ async def _submit_to_backend(question: str, files: List[dict]) -> dict:
             continue
 
         try:
+            size = await asyncio.to_thread(os.path.getsize, local_path)
+        except OSError as e:
+            log.error(f"AutoDataAgent — could not stat {local_path}: {e}")
+            skipped.append(f.get("filename") or "?")
+            continue
+
+        if size > _MAX_FILE_SIZE_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"File '{f.get('filename')}' is {size // (1024*1024)}MB, "
+                    f"exceeds the {_MAX_FILE_SIZE_BYTES // (1024*1024)}MB per-file limit."
+                ),
+            )
+        if total_bytes + size > _MAX_TOTAL_UPLOAD_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"Combined upload exceeds the "
+                    f"{_MAX_TOTAL_UPLOAD_BYTES // (1024*1024)}MB total limit."
+                ),
+            )
+        total_bytes += size
+
+        try:
             with open(local_path, "rb") as fh:
                 data = fh.read()
         except OSError as e:
@@ -294,16 +408,8 @@ async def _submit_to_backend(question: str, files: List[dict]) -> dict:
             skipped.append(f.get("filename") or "?")
             continue
 
-        # MIME guess from extension; backend uses extension anyway, but be polite.
         ext = os.path.splitext(f["filename"] or "")[1].lower()
-        mime = {
-            ".csv": "text/csv",
-            ".json": "application/json",
-            ".txt": "text/plain",
-            ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            ".xls": "application/vnd.ms-excel",
-            ".pdf": "application/pdf",
-        }.get(ext, "application/octet-stream")
+        mime = _EXT_MIME.get(ext, "application/octet-stream")
         multipart_files.append(("files", (f["filename"], data, mime)))
 
     if not multipart_files:
@@ -313,13 +419,14 @@ async def _submit_to_backend(question: str, files: List[dict]) -> dict:
         raise HTTPException(status_code=400, detail=detail)
 
     try:
-        async with httpx.AsyncClient(timeout=120) as client:
-            r = await client.post(
-                f"{_backend_url()}/api/v1/analysis/upload",
-                headers=await _auth_headers(),
-                data={"question": question, "agent_engine": "openmanus"},
-                files=multipart_files,
-            )
+        client = await _get_client()
+        r = await client.post(
+            f"{_backend_url()}/api/v1/analysis/upload",
+            headers=await _auth_headers(),
+            data={"question": question, "agent_engine": "openmanus"},
+            files=multipart_files,
+            timeout=httpx.Timeout(connect=10.0, read=120.0, write=60.0, pool=5.0),
+        )
     except httpx.RequestError as e:
         raise HTTPException(status_code=502, detail=f"AutoDataAgent backend unreachable: {e}") from e
 
@@ -354,35 +461,54 @@ async def handle_chat_completion(
     source_ids = _extract_source_ids(form_data)
 
     if not question and not files and not source_ids:
-        msg = (
-            "**Auto Data Analyst** is a data-analysis model.\n\n"
-            "To analyze data, either:\n"
-            "1. **Attach one or more CSV/Excel files** using the **+** button below, OR\n"
-            "2. **Pick a registered database source** from the data-source picker, OR\n"
-            "3. Just upload a file — I'll figure it out.\n\n"
-            "Then describe what you want to analyze (e.g. *“find sales trends and regional anomalies”*)."
-        )
-        return _build_response(form_data, msg, streaming)
-
-    if not files and not source_ids:
-        prior_task_id = _last_task_id_in_history(messages)
-        if prior_task_id:
-            # Multi-turn follow-up: previous analysis is visible in this chat.
+        org_sources = await _list_org_sources()
+        if org_sources:
+            names = ", ".join(s.get("display_name") or s.get("source_id") for s in org_sources[:5])
+            extra = f" (+{len(org_sources)-5} more)" if len(org_sources) > 5 else ""
             msg = (
-                "**Auto Data Analyst — follow-up**\n\n"
-                "Earlier in this chat I analyzed your data — see the panel above.\n\n"
-                "To ask a follow-up question, please **re-attach the same CSV(s)** "
-                "(or pick a database source) so I can run a fresh analysis with your new question.\n\n"
-                f"<!--auto-data-analyst:task_id={prior_task_id}-->"
+                "**Auto Data Analyst** is a data-analysis model.\n\n"
+                f"Available database sources: **{names}{extra}**.\n\n"
+                "Describe what you want to analyze and I'll run it automatically, "
+                "or attach a CSV/Excel file for ad-hoc data."
             )
         else:
             msg = (
-                "**Auto Data Analyst**\n\n"
-                "I received your question but no data. "
-                "Please attach one or more CSV/Excel files (**+** button) or pick a database "
-                "source from the data-source picker, then resend your question."
+                "**Auto Data Analyst** is a data-analysis model.\n\n"
+                "To analyze data, either:\n"
+                "1. **Attach one or more CSV/Excel files** using the **+** button below, OR\n"
+                "2. **Pick a registered database source** from the data-source picker, OR\n"
+                "3. Just upload a file — I'll figure it out.\n\n"
+                "Then describe what you want to analyze (e.g. *'find sales trends and regional anomalies'*)."
             )
         return _build_response(form_data, msg, streaming)
+
+    if not files and not source_ids:
+        # No explicit sources selected — try to auto-discover from org.
+        org_sources = await _list_org_sources()
+        if org_sources:
+            source_ids = [s["source_id"] for s in org_sources]
+            log.info(
+                "AutoDataAgent — auto-discovered %d org sources for question: %r",
+                len(source_ids), question[:80],
+            )
+        else:
+            prior_task_id = _last_task_id_in_history(messages)
+            if prior_task_id:
+                msg = (
+                    "**Auto Data Analyst — follow-up**\n\n"
+                    "Earlier in this chat I analyzed your data — see the panel above.\n\n"
+                    "To ask a follow-up question, please **re-attach the same CSV(s)** "
+                    "(or pick a database source) so I can run a fresh analysis with your new question.\n\n"
+                    f"<!--auto-data-analyst:task_id={prior_task_id}-->"
+                )
+            else:
+                msg = (
+                    "**Auto Data Analyst**\n\n"
+                    "I received your question but no data. "
+                    "Please attach one or more CSV/Excel files (**+** button) or pick a database "
+                    "source from the data-source picker, then resend your question."
+                )
+            return _build_response(form_data, msg, streaming)
 
     # Submit to backend — prefer source_ids when present, fall back to file upload.
     try:
