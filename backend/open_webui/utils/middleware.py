@@ -3876,6 +3876,14 @@ async def streaming_chat_response_handler(response, ctx):
                     )
                     last_delta_data = None
 
+                    # Tracks how many real "data:" SSE chunks arrived from upstream.
+                    # If it stays at zero and the stream ends without producing
+                    # content/tool_calls/output, we surface a friendly error to
+                    # the user instead of leaving the assistant message blank
+                    # (e.g. Telenor 504/empty-body cases).
+                    received_data_chunks = 0
+                    sse_idle_timeout_seconds = 60.0
+
                     async def flush_pending_delta_data(threshold: int = 0):
                         nonlocal delta_count
                         nonlocal last_delta_data
@@ -3890,7 +3898,22 @@ async def streaming_chat_response_handler(response, ctx):
                             delta_count = 0
                             last_delta_data = None
 
-                    async for line in response.body_iterator:
+                    body_iter = response.body_iterator.__aiter__()
+                    while True:
+                        try:
+                            line = await asyncio.wait_for(
+                                body_iter.__anext__(),
+                                timeout=sse_idle_timeout_seconds,
+                            )
+                        except StopAsyncIteration:
+                            break
+                        except asyncio.TimeoutError:
+                            log.warning(
+                                'stream_body_handler: SSE idle for %.0fs with no data — '
+                                'aborting (upstream likely hung)',
+                                sse_idle_timeout_seconds,
+                            )
+                            break
                         line = line.decode('utf-8', 'replace') if isinstance(line, bytes) else line
                         data = line
 
@@ -3904,6 +3927,7 @@ async def streaming_chat_response_handler(response, ctx):
 
                         # Remove the prefix
                         data = data[len('data:') :].strip()
+                        received_data_chunks += 1
 
                         try:
                             data = json.loads(data)
@@ -4565,6 +4589,49 @@ async def streaming_chat_response_handler(response, ctx):
                                 )
                         if responses_api_tool_calls:
                             tool_calls.append(_split_tool_calls(responses_api_tool_calls))
+
+                    # Empty-stream fallback. If upstream produced no SSE data
+                    # chunks and we have no content/tool-calls/message output
+                    # to show, surface a clear error to the chat instead of
+                    # leaving the assistant message blank.
+                    has_message_text = any(
+                        item.get('type') == 'message'
+                        and any(
+                            (part.get('text') or '').strip()
+                            for part in (item.get('content') or [])
+                        )
+                        for item in output
+                    )
+                    if (
+                        received_data_chunks == 0
+                        and not content
+                        and not response_tool_calls
+                        and not tool_calls
+                        and not has_message_text
+                    ):
+                        _err_msg = (
+                            'The model service did not return a response '
+                            '(upstream timed out or returned no data). '
+                            'Please try again — if the problem persists, the LLM '
+                            'endpoint may be experiencing an outage.'
+                        )
+                        log.warning(
+                            'stream_body_handler: empty upstream stream — emitting '
+                            'friendly error to user'
+                        )
+                        content = _err_msg
+                        output.clear()
+                        output.append({
+                            'type': 'message',
+                            'id': output_id('msg'),
+                            'status': 'completed',
+                            'role': 'assistant',
+                            'content': [{'type': 'output_text', 'text': _err_msg}],
+                        })
+                        await event_emitter({
+                            'type': 'chat:completion',
+                            'data': {'content': serialize_output(output)},
+                        })
 
                 try:
                     await stream_body_handler(response, form_data)
